@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# plazirhangar — unified ship/entrypoint for xbgst-stack + xbrd surface
+set -euo pipefail
+
+CMD="${1:-status}"
+shift || true
+
+case "$CMD" in
+  install)
+    echo "→ marketplaces"
+    grok plugin marketplace add VeigaPunk/grok-marketplace 2>/dev/null || true
+    grok plugin marketplace add VeigaPunk/ds4cc-marketplace 2>/dev/null || true
+    echo "→ xbgst-stack"
+    grok plugin install xbgst-stack@veigapunk/grok-marketplace --trust || true
+    STACK=$(ls -d "$HOME"/.grok/installed-plugins/xbgst-stack-* 2>/dev/null | head -1 || true)
+    if [[ -n "${STACK:-}" && -x "$STACK/scripts/install-host.sh" ]]; then
+      bash "$STACK/scripts/install-host.sh"
+      if [[ -x "$STACK/livepatch/scripts/check-and-patch.sh" ]]; then
+        GROK_LIVEPATCH_FORCE=1 bash "$STACK/livepatch/scripts/check-and-patch.sh" || true
+      fi
+    fi
+    echo "→ L3 sekhmet / xbrd-spark"
+    cargo install --git https://github.com/VeigaPunk/xbrd-spark --locked --force 2>/dev/null || echo "⚠ cargo install xbrd-spark failed (network or rustup)"
+    echo "→ configs"
+    mkdir -p "$HOME/.grok" "$HOME/.xbgst"
+    curl -fsSL https://veigapunk.github.io/ds4cc-marketplace/grok-cli-config.toml -o "$HOME/.grok/config.toml" 2>/dev/null || true
+    echo "✓ install complete — run: plazirhangar status"
+    ;;
+  status)
+    echo "=== plazirhangar status ==="
+    command -v grok >/dev/null && grok --version 2>/dev/null || echo "grok: missing"
+    command -v sekhmet >/dev/null && sekhmet --version 2>/dev/null || command -v xbrd-spark >/dev/null && echo "xbrd-spark present" || echo "sekhmet/xbrd-spark: missing"
+    [[ -f "$HOME/.grok/config.toml" ]] && echo "config.toml: present" || echo "config.toml: missing"
+    [[ -d "$HOME/.grok/skills/xbgst" ]] && echo "xbgst skill: present" || echo "xbgst skill: missing"
+    systemctl --user is-active grok-build-livepatch.timer 2>/dev/null || echo "livepatch timer: inactive or missing"
+    ;;
+  swarm)
+    sekhmet swarm "$@" || xbrd-spark swarm "$@" || echo "sekhmet/xbrd-spark not on PATH"
+    ;;
+  judge|xbgst)
+    echo "Use: grok (with xbgst-stack enabled) or paste xbgst skill"
+    ;;
+  config)
+    echo "~/.grok/config.toml:"
+    cat "$HOME/.grok/config.toml" 2>/dev/null || echo "(missing)"
+    ;;
+  *)
+    echo "Usage: plazirhangar {install|status|swarm|judge|config}"
+    exit 1
+    ;;
+esac

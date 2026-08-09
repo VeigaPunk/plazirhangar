@@ -1,0 +1,51 @@
+# Recommended Grok Build CLI config for VeigaPunk livepatch + xbgst-stack.
+# Primary: https://veigapunk.github.io/ds4cc-marketplace/grok-cli-config.toml
+# Copied into plazirhangar for offline/ship completeness.
+
+[cli]
+installer = "internal"
+
+[marketplace]
+default_skills_installs_purged = true
+official_marketplace_auto_installed = true
+
+[[marketplace.sources]]
+name = "xAI Official"
+git = "https://github.com/xai-org/plugin-marketplace.git"
+
+[[marketplace.sources]]
+name = "grok-marketplace"
+git = "https://github.com/VeigaPunk/grok-marketplace.git"
+
+[[marketplace.sources]]
+name = "ds4cc-marketplace"
+git = "https://github.com/VeigaPunk/ds4cc-marketplace.git"
+
+[ui]
+max_thoughts_width = 120
+fork_secondary_model = "grok-4.5"
+yolo = false
+compact_mode = false
+permission_mode = "always-approve"
+
+[plugins]
+enabled = [
+    "exa",
+    "tinyfish",
+    "cloudflare",
+    "xbgst-stack",
+    "heuer-planning",
+]
+
+[models]
+default = "grok-4.5"
+default_reasoning_effort = "low"
+
+[subagents]
+enabled = true
+max_depth = 1
+max_concurrent = 16
+
+[subagents.toggle]
+explore = false
+general-purpose = false

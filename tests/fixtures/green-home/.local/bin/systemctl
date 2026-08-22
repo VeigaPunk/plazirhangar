@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Hermetic systemctl stub for green-home livepatch timer.
+if [[ "${1:-}" == "--user" && "${2:-}" == "is-active" && "${3:-}" == "grok-build-livepatch.timer" ]]; then
+  echo "active"
+  exit 0
+fi
+if [[ "${1:-}" == "--user" && "${2:-}" == "is-enabled" && "${3:-}" == "grok-build-livepatch.timer" ]]; then
+  echo "enabled"
+  exit 0
+fi
+echo "inactive" >&2
+exit 1

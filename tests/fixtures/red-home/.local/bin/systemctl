@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Hermetic systemctl stub for red-home (timer never active).
+if [[ "${1:-}" == "--user" && "${2:-}" == "is-active" ]]; then
+  echo "inactive"
+  exit 3
+fi
+echo "inactive"
+exit 1

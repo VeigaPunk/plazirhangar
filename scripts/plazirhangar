@@ -2,50 +2,656 @@
 # plazirhangar — unified ship/entrypoint for xbgst-stack + xbrd surface
 set -euo pipefail
 
+PLUGIN_NAME="xbgst-stack"
+MARKETPLACE_GROK="VeigaPunk/grok-marketplace"
+MARKETPLACE_DS4CC="VeigaPunk/ds4cc-marketplace"
+PLUGIN_SPEC="xbgst-stack@veigapunk/grok-marketplace"
+BAN_NEEDLE="are banned and will be rejected"
+
 CMD="${1:-status}"
 shift || true
 
-case "$CMD" in
-  install)
-    echo "→ marketplaces"
-    grok plugin marketplace add VeigaPunk/grok-marketplace 2>/dev/null || true
-    grok plugin marketplace add VeigaPunk/ds4cc-marketplace 2>/dev/null || true
-    echo "→ xbgst-stack"
-    grok plugin install xbgst-stack@veigapunk/grok-marketplace --trust || true
-    STACK=$(ls -d "$HOME"/.grok/installed-plugins/xbgst-stack-* 2>/dev/null | head -1 || true)
-    if [[ -n "${STACK:-}" && -x "$STACK/scripts/install-host.sh" ]]; then
-      bash "$STACK/scripts/install-host.sh"
-      if [[ -x "$STACK/livepatch/scripts/check-and-patch.sh" ]]; then
-        GROK_LIVEPATCH_FORCE=1 bash "$STACK/livepatch/scripts/check-and-patch.sh" || true
+die() { echo "FAIL: $*" >&2; exit 1; }
+
+usage() {
+  echo "Usage: plazirhangar {install|status|swarm|judge|config}"
+  echo "  install [--from-tree DIR] [--skip-livepatch] [--skip-cargo]"
+}
+
+# Resolve this script's real path (PATH install / piped-with-PLAZIRHANGAR_SRC).
+resolve_self_src() {
+  local src=""
+  if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" && -f "${BASH_SOURCE[0]}" ]]; then
+    src="${BASH_SOURCE[0]}"
+  elif [[ -n "${PLAZIRHANGAR_SRC:-}" && -f "$PLAZIRHANGAR_SRC" ]]; then
+    src="$PLAZIRHANGAR_SRC"
+  else
+    die "piped/non-file invocation without PLAZIRHANGAR_SRC (clone repo or set PLAZIRHANGAR_SRC to scripts/plazirhangar)"
+  fi
+  if command -v readlink >/dev/null 2>&1; then
+    readlink -f "$src" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$src"
+  else
+    python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$src"
+  fi
+}
+
+resolve_vendor_cfg() {
+  local self root cand
+  self="$(resolve_self_src)"
+  root="$(cd "$(dirname "$self")/.." && pwd)"
+  cand="${PLAZIRHANGAR_ROOT:-$root}/configs/grok-cli-config.toml"
+  [[ -f "$cand" ]] || die "vendored configs/grok-cli-config.toml missing (PLAZIRHANGAR_ROOT=$root)"
+  printf '%s\n' "$cand"
+}
+
+# --- resolve_plugin_dir (from grok-marketplace install-xbgst-stack.sh) ---
+
+resolve_plugin_dir() {
+  local grok_home=$1
+  local details path reg_path
+  local -a matches=()
+  local d name
+
+  if command -v grok >/dev/null 2>&1; then
+    if details=$(GROK_HOME="$grok_home" grok plugin details "$PLUGIN_NAME" 2>/dev/null); then
+      path=""
+      while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*path:[[:space:]]*(.+)$ ]]; then
+          path=${BASH_REMATCH[1]}
+          path=${path%"${path##*[![:space:]]}"}
+          break
+        fi
+      done <<<"$details"
+      if [[ -n "$path" && -d "$path" && -f "$path/plugin.json" ]]; then
+        name=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("name",""))' "$path/plugin.json")
+        if [[ "$name" == "$PLUGIN_NAME" ]]; then
+          printf '%s\n' "$path"
+          return 0
+        fi
       fi
     fi
-    echo "→ L3 sekhmet / xbrd-spark"
-    cargo install --git https://github.com/VeigaPunk/xbrd-spark --locked --force 2>/dev/null || echo "⚠ cargo install xbrd-spark failed (network or rustup)"
-    echo "→ configs"
-    mkdir -p "$HOME/.grok" "$HOME/.xbgst"
-    curl -fsSL https://veigapunk.github.io/ds4cc-marketplace/grok-cli-config.toml -o "$HOME/.grok/config.toml" 2>/dev/null || true
-    echo "✓ install complete — run: plazirhangar status"
+  fi
+
+  if [[ -f "$grok_home/installed-plugins/registry.json" ]]; then
+    set +e
+    reg_path=$(GROK_HOME="$grok_home" PLUGIN_NAME="$PLUGIN_NAME" python3 - <<'PY'
+import json, os, sys
+home = os.environ["GROK_HOME"]
+want = os.environ["PLUGIN_NAME"]
+reg = json.load(open(os.path.join(home, "installed-plugins", "registry.json")))
+hits = []
+for _k, repo in (reg.get("repos") or {}).items():
+    plugins = repo.get("plugins") or {}
+    if want in plugins:
+        p = repo.get("path") or ""
+        if p and os.path.isdir(p):
+            hits.append(p)
+if len(hits) == 1:
+    print(hits[0])
+    sys.exit(0)
+if len(hits) > 1:
+    sys.exit(2)
+sys.exit(1)
+PY
+)
+    local reg_ec=$?
+    set -e
+    if [[ "$reg_ec" -eq 2 ]]; then
+      die "multiple registry entries for $PLUGIN_NAME; refuse planted/ambiguous plugin"
+    fi
+    if [[ "$reg_ec" -eq 0 && -n "${reg_path:-}" ]]; then
+      printf '%s\n' "$reg_path"
+      return 0
+    fi
+  fi
+
+  shopt -s nullglob
+  for d in "$grok_home"/installed-plugins/xbgst-stack-*; do
+    [[ -d "$d" && -f "$d/plugin.json" ]] || continue
+    name=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("name",""))' "$d/plugin.json")
+    if [[ "$name" == "$PLUGIN_NAME" ]]; then
+      matches+=("$d")
+    fi
+  done
+  shopt -u nullglob
+
+  if [[ "${#matches[@]}" -eq 1 ]]; then
+    printf '%s\n' "${matches[0]}"
+    return 0
+  fi
+  if [[ "${#matches[@]}" -eq 0 ]]; then
+    die "no installed plugin dir with plugin.json name=$PLUGIN_NAME under $grok_home/installed-plugins"
+  fi
+  die "multiple plugin dirs named $PLUGIN_NAME under installed-plugins; refuse planted/ambiguous plugin"
+}
+
+# Treat "Marketplace source already configured" as success; other errors fail-closed.
+marketplace_add_idempotent() {
+  local src=$1
+  local out ec
+  echo "→ marketplace add $src"
+  set +e
+  out="$(grok plugin marketplace add "$src" 2>&1)"
+  ec=$?
+  set -e
+  if [[ "$ec" -eq 0 ]]; then
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    return 0
+  fi
+  if printf '%s\n' "$out" | grep -qF 'Marketplace source already configured'; then
+    echo "✓ marketplace already configured: $src"
+    return 0
+  fi
+  printf '%s\n' "$out" >&2
+  die "marketplace add failed for $src (exit $ec)"
+}
+
+merge_enable_plugin() {
+  local cfg=$1
+  if [[ ! -f "$cfg" ]]; then
+    echo "→ no $cfg — not writing a recommended toml"
+    echo "  hint: enable plugins.enabled to include \"$PLUGIN_NAME\""
+    return 0
+  fi
+  GROK_CFG="$cfg" PLUGIN_NAME="$PLUGIN_NAME" python3 - <<'PY'
+import os, re, sys, tempfile
+path = os.environ["GROK_CFG"]
+want = os.environ["PLUGIN_NAME"]
+text = open(path, encoding="utf-8").read()
+if re.search(r'(?m)^\s*"' + re.escape(want) + r'"\s*,?\s*$', text):
+    print(f"✓ config already enables {want}")
+    sys.exit(0)
+m = re.search(r'(?ms)^(\[plugins\][^\[]*?enabled\s*=\s*\[)(.*?)(\])', text)
+if not m:
+    print(f"FAIL: {path} has no [plugins] enabled = [...] to merge", file=sys.stderr)
+    sys.exit(1)
+body = m.group(2)
+indent = "    "
+for line in body.splitlines():
+    if line.strip():
+        indent = re.match(r'^(\s*)', line).group(1) or indent
+        break
+insertion = f'{indent}"{want}",\n'
+if body.strip() and not body.endswith("\n"):
+    body = body + "\n"
+new_text = text[:m.start()] + m.group(1) + body + insertion + m.group(3) + text[m.end():]
+if not new_text.endswith("\n"):
+    new_text += "\n"
+d = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(prefix=".plazirhangar-", suffix=".tmp", dir=d)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    os.replace(tmp, path)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+print(f"✓ merge-enabled {want} in {path}")
+PY
+}
+
+# Merge [subagents] locks + marketplace URLs; never drop extra plugins/models.
+merge_config_fail_closed() {
+  local cfg=$1
+  local vendor=$2
+  GROK_CFG="$cfg" VENDOR_CFG="$vendor" python3 - <<'PY'
+import os, re, tempfile
+
+cfg = os.environ["GROK_CFG"]
+text = open(cfg, encoding="utf-8").read()
+want_urls = [
+    "https://github.com/VeigaPunk/grok-marketplace.git",
+    "https://github.com/VeigaPunk/ds4cc-marketplace.git",
+]
+
+def ensure_marketplace_urls(t: str) -> str:
+    missing = [u for u in want_urls if u not in t]
+    if not missing:
+        return t
+    block = ""
+    for u in missing:
+        name = "grok-marketplace" if "grok-marketplace" in u else "ds4cc-marketplace"
+        block += f'\n[[marketplace.sources]]\nname = "{name}"\ngit = "{u}"\n'
+    matches = list(re.finditer(r'(?ms)^\[\[marketplace\.sources\]\].*?(?=^\[|\Z)', t))
+    if matches:
+        m = matches[-1]
+        return t[: m.end()] + block + t[m.end() :]
+    m = re.search(r'(?ms)^\[marketplace\].*?(?=^\[|\Z)', t)
+    if m:
+        return t[: m.end()] + block + t[m.end() :]
+    return t.rstrip() + "\n" + block
+
+def ensure_subagents_section(t: str) -> str:
+    if re.search(r'(?m)^\[subagents\]', t):
+        return t
+    return t.rstrip() + (
+        "\n[subagents]\n"
+        "enabled = true\n"
+        "max_depth = 1\n"
+        "max_concurrent = 16\n"
+        "\n[subagents.toggle]\n"
+        "explore = false\n"
+        "general-purpose = false\n"
+    )
+
+def section_body_span(t: str, header: str):
+    m = re.search(rf'(?m)^\[{re.escape(header)}\][ \t]*\n', t)
+    if not m:
+        return None
+    start = m.end()
+    n = re.search(r'(?m)^\[', t[start:])
+    end = start + n.start() if n else len(t)
+    return start, end
+
+def set_key_in_section(t: str, header: str, key: str, value: str) -> str:
+    span = section_body_span(t, header)
+    if not span:
+        return t.rstrip() + f"\n[{header}]\n{key} = {value}\n"
+    start, end = span
+    body = t[start:end]
+    pat = re.compile(rf'(?m)^([ \t]*{re.escape(key)}[ \t]*=[ \t]*)([^\n#]+)')
+    if pat.search(body):
+        new_body = pat.sub(rf'\g<1>{value}', body, count=1)
+        return t[:start] + new_body + t[end:]
+    return t[:start] + f"{key} = {value}\n" + t[start:]
+
+def clamp_max_concurrent(t: str) -> str:
+    span = section_body_span(t, "subagents")
+    if not span:
+        return set_key_in_section(t, "subagents", "max_concurrent", "16")
+    start, end = span
+    body = t[start:end]
+    mc = re.search(r'(?m)^([ \t]*max_concurrent[ \t]*=[ \t]*)([^\n#]+)', body)
+    if mc:
+        raw = mc.group(2).strip().strip('"').strip("'")
+        try:
+            n = int(raw)
+            out = 16 if (n > 16 or n < 1) else n
+        except ValueError:
+            out = 16
+        new_body = body[: mc.start()] + mc.group(1) + str(out) + body[mc.end() :]
+        return t[:start] + new_body + t[end:]
+    return set_key_in_section(t, "subagents", "max_concurrent", "16")
+
+def set_toggle(t: str, key: str) -> str:
+    span = section_body_span(t, "subagents.toggle")
+    if span:
+        start, end = span
+        body = t[start:end]
+        pat = re.compile(rf'(?m)^([ \t]*{re.escape(key)}[ \t]*=[ \t]*)([^\n#]+)')
+        if pat.search(body):
+            new_body = pat.sub(r'\g<1>false', body, count=1)
+            return t[:start] + new_body + t[end:]
+        return t[:start] + f"{key} = false\n" + t[start:]
+    m = re.search(r'(?ms)^\[subagents\].*?(?=^\[(?!subagents))', t)
+    if m:
+        return t[: m.end()] + f"\n[subagents.toggle]\n{key} = false\n" + t[m.end() :]
+    return t.rstrip() + f"\n[subagents.toggle]\n{key} = false\n"
+
+t = text
+t = ensure_marketplace_urls(t)
+t = ensure_subagents_section(t)
+t = set_key_in_section(t, "subagents", "max_depth", "1")
+t = clamp_max_concurrent(t)
+t = set_toggle(t, "explore")
+t = set_toggle(t, "general-purpose")
+if not t.endswith("\n"):
+    t += "\n"
+d = os.path.dirname(cfg) or "."
+fd, tmp = tempfile.mkstemp(prefix=".plazirhangar-", suffix=".tmp", dir=d)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(t)
+    os.replace(tmp, cfg)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+print(f"✓ merged subagents + marketplaces into {cfg}")
+PY
+  merge_enable_plugin "$cfg"
+}
+
+resolve_from_tree() {
+  local from_tree=$1
+  local stack name
+  [[ -d "$from_tree" ]] || die "--from-tree not a directory: $from_tree"
+  if [[ -f "$from_tree/plugin.json" ]]; then
+    stack="$from_tree"
+  elif [[ -f "$from_tree/plugins/xbgst-stack/plugin.json" ]]; then
+    stack="$from_tree/plugins/xbgst-stack"
+  else
+    die "--from-tree needs plugin.json name=xbgst-stack or plugins/xbgst-stack/"
+  fi
+  name=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("name",""))' "$stack/plugin.json")
+  [[ "$name" == "$PLUGIN_NAME" ]] || die "plugin.json name is '$name' (want $PLUGIN_NAME)"
+  printf '%s\n' "$stack"
+}
+
+# --- status helpers (HOME / GROK_HOME / XDG_CONFIG_HOME / PATH relocatable) ---
+
+cmd_status() {
+  # Honor env overrides; do not `local` same names (would shadow to empty).
+  local grok_home xdg_config_home xbgst_home
+  grok_home="${GROK_HOME:-$HOME/.grok}"
+  xdg_config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+  xbgst_home="${XBGST_HOME:-$HOME/.xbgst}"
+
+  local GREEN RED DIM RESET
+  GREEN=$'\033[32m'; RED=$'\033[31m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+  [[ -t 1 ]] || { GREEN=""; RED=""; DIM=""; RESET=""; }
+
+  local fails=0
+  pass() { printf '%sPASS%s  %-34s %s%s%s\n' "$GREEN" "$RESET" "$1" "$DIM" "$2" "$RESET"; }
+  fail() { printf '%sFAIL%s  %-34s %s%s%s\n' "$RED" "$RESET" "$1" "$DIM" "$2" "$RESET"; fails=$((fails + 1)); }
+
+  local cfg="$grok_home/config.toml"
+  local live_bin="${GROK_LIVEPATCH_INSTALL:-$HOME/.local/opt/grok-build-livepatch}/grok"
+  local unit="$xdg_config_home/systemd/user/grok-build-livepatch.service"
+  local bin_link="$grok_home/bin/grok"
+  local env_l3="$xbgst_home/env.l3-sekhmet.sh"
+
+  # --- livepatch (INLINE probes only; never trust install-timer --status) ---
+  local ban=no replace=0 active_cli=no timer=no
+  local active="" live="" probe=""
+
+  live="$(readlink -f "$live_bin" 2>/dev/null || true)"
+  if [[ -e "$bin_link" || -L "$bin_link" ]]; then
+    active="$(readlink -f "$bin_link" 2>/dev/null || true)"
+    if [[ -n "$active" && -n "$live" && "$active" == "$live" ]]; then
+      active_cli=yes
+    fi
+  fi
+
+  for probe in "$live_bin" "$bin_link"; do
+    if [[ -e "$probe" || -L "$probe" ]] && grep -aobF "$BAN_NEEDLE" "$probe" >/dev/null 2>&1; then
+      ban=yes
+      break
+    fi
+  done
+
+  if [[ -f "$unit" ]] && grep -qE '^Environment=GROK_LIVEPATCH_REPLACE_BIN=1' "$unit"; then
+    replace=1
+  fi
+
+  local timer_st
+  timer_st="$(systemctl --user is-active grok-build-livepatch.timer 2>/dev/null || true)"
+  if [[ "$timer_st" == "active" ]]; then
+    timer=yes
+  fi
+
+  if [[ "$ban" == "yes" && ( "$replace" -eq 1 || "$active_cli" == "yes" ) && "$timer" == "yes" ]]; then
+    pass "livepatch" "ban=$ban replace=$replace active_cli=$active_cli timer=$timer"
+  else
+    fail "livepatch" "ban=$ban replace=$replace active_cli=$active_cli timer=$timer"
+  fi
+
+  # --- sekhmet (or xbrd-spark) ---
+  local spark_bin="" ver=""
+  if spark_bin="$(command -v sekhmet 2>/dev/null)"; then
+    :
+  elif spark_bin="$(command -v xbrd-spark 2>/dev/null)"; then
+    :
+  else
+    spark_bin=""
+  fi
+  if [[ -n "$spark_bin" ]]; then
+    ver="$("$spark_bin" --version 2>/dev/null | head -n1 || true)"
+    if [[ -n "$ver" ]]; then
+      pass "sekhmet" "$spark_bin → $ver"
+    else
+      fail "sekhmet" "$spark_bin --version empty"
+    fi
+  else
+    fail "sekhmet" "sekhmet/xbrd-spark not on PATH"
+  fi
+
+  # --- xbgst skill + agents ---
+  if [[ -f "$grok_home/skills/xbgst/SKILL.md" \
+     && -f "$grok_home/agents/the-planner.md" \
+     && -f "$grok_home/agents/explore.md" ]]; then
+    pass "xbgst" "skill+the-planner+explore"
+  else
+    fail "xbgst" "need skills/xbgst/SKILL.md + agents/{the-planner,explore}.md"
+  fi
+
+  # --- subagents: [subagents] max_*; [subagents.toggle] explore/gp (tomllib) ---
+  if [[ ! -f "$cfg" ]]; then
+    fail "subagents" "missing $cfg"
+  else
+    local detail="" sub_ec=0
+    set +e
+    detail="$(GROK_CFG="$cfg" python3 - <<'PY'
+import os, sys, tomllib
+
+path = os.environ["GROK_CFG"]
+try:
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+except Exception as e:
+    print(f"invalid toml: {e}")
+    sys.exit(1)
+
+sub = data.get("subagents")
+if not isinstance(sub, dict):
+    print("missing [subagents]")
+    sys.exit(1)
+
+toggle = sub.get("toggle")
+if not isinstance(toggle, dict):
+    toggle = {}
+
+md = sub.get("max_depth")
+mc = sub.get("max_concurrent")
+ex = toggle.get("explore", None)
+gp = toggle.get("general-purpose", None)
+
+def is_false(v):
+    return v is False or v == "false"
+
+parts = []
+ok = True
+if md != 1:
+    ok = False
+    parts.append("max_depth=?" if md is None else f"max_depth={md}")
+if not is_false(ex):
+    ok = False
+    parts.append("explore=?" if ex is None else f"explore={ex}")
+if not is_false(gp):
+    ok = False
+    parts.append("general-purpose=?" if gp is None else f"general-purpose={gp}")
+if "max_concurrent" not in sub:
+    ok = False
+    parts.append("max_concurrent=<absent>")
+elif isinstance(mc, bool) or not isinstance(mc, int) or mc < 1 or mc > 16:
+    ok = False
+    parts.append(f"max_concurrent={mc}")
+else:
+    parts.append(f"max_concurrent={mc}")
+
+print(" ".join(parts))
+sys.exit(0 if ok else 1)
+PY
+)"
+    sub_ec=$?
+    set -e
+    if (( sub_ec == 0 )); then
+      pass "subagents" "max_depth=1 explore=false gp=false${detail:+ $detail}"
+    else
+      fail "subagents" "${detail:-bad [subagents] keys}"
+    fi
+  fi
+
+  # --- marketplaces ---
+  if [[ ! -f "$cfg" ]]; then
+    fail "marketplaces" "missing $cfg"
+  elif grep -q 'github.com/VeigaPunk/grok-marketplace.git' "$cfg" \
+    && grep -q 'github.com/VeigaPunk/ds4cc-marketplace.git' "$cfg"; then
+    pass "marketplaces" "grok-marketplace + ds4cc-marketplace"
+  else
+    fail "marketplaces" "need both VeigaPunk grok+ds4cc marketplace.git URLs"
+  fi
+
+  # --- l3env ---
+  local jobs=""
+  if [[ ! -f "$env_l3" ]]; then
+    fail "l3env" "missing $env_l3"
+  else
+    jobs="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\{0,1\}XBRD_SPARK_JOBS[[:space:]]*=[[:space:]]*//p' "$env_l3" \
+      | head -n1 | tr -d "\"'" | tr -d '[:space:]')"
+    if [[ "$jobs" == "64" ]]; then
+      pass "l3env" "XBRD_SPARK_JOBS=64 ($env_l3)"
+    else
+      fail "l3env" "XBRD_SPARK_JOBS=${jobs:-<unset>} (want 64)"
+    fi
+  fi
+
+  printf '%s\n' "-----"
+  if (( fails == 0 )); then
+    printf '%sOK%s    all checks green\n' "$GREEN" "$RESET"
+    exit 0
+  fi
+  printf '%sBAD%s   %d check(s) red\n' "$RED" "$RESET" "$fails"
+  exit 1
+}
+
+cmd_install() {
+  local from_tree="" skip_livepatch=0 skip_cargo=0
+  local grok_home xbgst_home self_src stack host_sh patch_sh patch_ec
+  local vendor_cfg cfg env_l3
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h) usage; exit 0 ;;
+      --from-tree)
+        [[ $# -ge 2 ]] || die "--from-tree requires a path"
+        from_tree=$2
+        shift 2
+        ;;
+      --skip-livepatch) skip_livepatch=1; shift ;;
+      --skip-cargo) skip_cargo=1; shift ;;
+      --*) die "unknown option: $1" ;;
+      *) die "unexpected positional arg: $1" ;;
+    esac
+  done
+
+  grok_home="${GROK_HOME:-$HOME/.grok}"
+  xbgst_home="${XBGST_HOME:-$HOME/.xbgst}"
+  export GROK_HOME="$grok_home"
+
+  self_src="$(resolve_self_src)"
+  echo "→ PATH install: $self_src → $HOME/.local/bin/plazirhangar"
+  install -Dm755 "$self_src" "$HOME/.local/bin/plazirhangar"
+
+  mkdir -p "$grok_home" "$xbgst_home"
+
+  if [[ -n "$from_tree" ]]; then
+    stack="$(resolve_from_tree "$from_tree")"
+    echo "→ --from-tree: $stack"
+  else
+    command -v grok >/dev/null 2>&1 || die "grok not on PATH"
+    marketplace_add_idempotent "$MARKETPLACE_GROK"
+    marketplace_add_idempotent "$MARKETPLACE_DS4CC"
+    echo "→ plugin install $PLUGIN_SPEC --trust"
+    grok plugin install "$PLUGIN_SPEC" --trust
+    stack="$(resolve_plugin_dir "$grok_home")"
+  fi
+
+  host_sh="$stack/scripts/install-host.sh"
+  [[ -f "$host_sh" && -x "$host_sh" ]] || [[ -f "$host_sh" ]] || die "missing $host_sh"
+  echo "→ install-host from $stack"
+  bash "$host_sh"
+
+  if [[ "$skip_livepatch" -eq 0 ]]; then
+    patch_sh="$stack/livepatch/scripts/check-and-patch.sh"
+    [[ -f "$patch_sh" ]] || die "missing $patch_sh (use --skip-livepatch to skip)"
+    echo "→ livepatch check-and-patch"
+    set +e
+    GROK_LIVEPATCH_FORCE=1 bash "$patch_sh"
+    patch_ec=$?
+    set -e
+    if [[ "$patch_ec" -eq 2 ]]; then
+      echo "needs-rebase" >&2
+      echo "FAIL: livepatch needs human rebase — timer not enabled" >&2
+      exit 2
+    fi
+    if [[ "$patch_ec" -ne 0 ]]; then
+      die "check-and-patch exited $patch_ec"
+    fi
+    echo "→ install-host --install-timer (post-patch ok)"
+    bash "$host_sh" --install-timer
+  else
+    echo "→ --skip-livepatch: not running check-and-patch / install-timer"
+  fi
+
+  if [[ "$skip_cargo" -eq 0 ]]; then
+    if command -v sekhmet >/dev/null 2>&1 || command -v xbrd-spark >/dev/null 2>&1; then
+      echo "→ sekhmet/xbrd-spark already on PATH — skip cargo"
+    else
+      command -v cargo >/dev/null 2>&1 || die "cargo not on PATH (sekhmet/xbrd-spark missing; use --skip-cargo)"
+      echo "→ cargo install xbrd-spark"
+      cargo install --git https://github.com/VeigaPunk/xbrd-spark --locked --force
+    fi
+  else
+    echo "→ --skip-cargo"
+  fi
+
+  cfg="$grok_home/config.toml"
+  vendor_cfg="$(resolve_vendor_cfg)"
+  if [[ ! -f "$cfg" ]]; then
+    echo "→ config missing — copy vendored $vendor_cfg"
+    install -Dm644 "$vendor_cfg" "$cfg"
+  else
+    echo "→ merge config (no clobber extras)"
+    merge_config_fail_closed "$cfg" "$vendor_cfg"
+  fi
+
+  env_l3="$xbgst_home/env.l3-sekhmet.sh"
+  if [[ ! -f "$env_l3" ]]; then
+    echo "→ write L3 env $env_l3"
+    cat >"$env_l3" <<'EOF'
+# L3 sekhmet / xbrd-spark concurrency plane (host specialists ≤16 stay in config)
+export XBRD_SPARK_JOBS=64
+export XBRD_SPARK_SERVICE_TIER=fast
+EOF
+  else
+    echo "→ L3 env present — leave untouched"
+  fi
+
+  echo "✓ install complete — run: plazirhangar status"
+}
+
+case "$CMD" in
+  install)
+    cmd_install "$@"
     ;;
   status)
-    echo "=== plazirhangar status ==="
-    command -v grok >/dev/null && grok --version 2>/dev/null || echo "grok: missing"
-    command -v sekhmet >/dev/null && sekhmet --version 2>/dev/null || command -v xbrd-spark >/dev/null && echo "xbrd-spark present" || echo "sekhmet/xbrd-spark: missing"
-    [[ -f "$HOME/.grok/config.toml" ]] && echo "config.toml: present" || echo "config.toml: missing"
-    [[ -d "$HOME/.grok/skills/xbgst" ]] && echo "xbgst skill: present" || echo "xbgst skill: missing"
-    systemctl --user is-active grok-build-livepatch.timer 2>/dev/null || echo "livepatch timer: inactive or missing"
+    cmd_status
     ;;
   swarm)
-    sekhmet swarm "$@" || xbrd-spark swarm "$@" || echo "sekhmet/xbrd-spark not on PATH"
+    if command -v sekhmet >/dev/null 2>&1; then
+      sekhmet swarm "$@"
+    elif command -v xbrd-spark >/dev/null 2>&1; then
+      xbrd-spark swarm "$@"
+    else
+      echo "sekhmet/xbrd-spark not on PATH"
+      exit 1
+    fi
     ;;
   judge|xbgst)
     echo "Use: grok (with xbgst-stack enabled) or paste xbgst skill"
     ;;
   config)
-    echo "~/.grok/config.toml:"
-    cat "$HOME/.grok/config.toml" 2>/dev/null || echo "(missing)"
+    echo "${GROK_HOME:-$HOME/.grok}/config.toml:"
+    cat "${GROK_HOME:-$HOME/.grok}/config.toml" 2>/dev/null || echo "(missing)"
     ;;
   *)
-    echo "Usage: plazirhangar {install|status|swarm|judge|config}"
+    usage
     exit 1
     ;;
 esac

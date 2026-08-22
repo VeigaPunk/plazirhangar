@@ -1,0 +1,8 @@
+[Unit]
+Description=Grok Build livepatch (fixture)
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+Environment=GROK_LIVEPATCH_REPLACE_BIN=1
+[Install]
+WantedBy=default.target

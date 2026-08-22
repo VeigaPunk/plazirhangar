@@ -29,7 +29,7 @@ Six rows; prints `OK` / `BAD`. Exit **0** only when every row is PASS.
 | `livepatch` | livepatch active: ban in binary + REPLACE_BIN (or active_cli=livepatch) + user timer active |
 | `sekhmet` | `sekhmet` or `xbrd-spark` on PATH with a version |
 | `xbgst` | xbgst skill + agents (incl. banned stubs) under `~/.grok` |
-| `subagents` | `max_depth=1`, `explore=false`, `general-purpose=false`; `max_concurrent` ≤16 if set |
+| `subagents` | `max_depth=1`, `explore=false`, `general-purpose=false`; `max_concurrent` **required** integer **1..16** |
 | `marketplaces` | both VeigaPunk grok-marketplace + ds4cc-marketplace git URLs in config |
 | `l3env` | `~/.xbgst/env.l3-sekhmet.sh` assigns `XBRD_SPARK_JOBS=64` |
 
@@ -38,7 +38,8 @@ Six rows; prints `OK` / `BAD`. Exit **0** only when every row is PASS.
 Fail-closed. Does **not** curl-overwrite `~/.grok/config.toml`.
 
 - Merge required keys from vendored `configs/grok-cli-config.toml` (keep extra plugins/models)
-- Host specialists: grok `[subagents].max_concurrent` ≤ **16**; L3 plane is independent (`XBRD_SPARK_JOBS=64`)
+- Host specialists: grok `[subagents].max_concurrent` **required** integer **1..16**; L3 plane is independent (`XBRD_SPARK_JOBS=64`, `XBRD_SPARK_SERVICE_TIER=fast`)
+- Marketplace add: already-configured is success (exists-check); other errors abort
 - Livepatch: `GROK_LIVEPATCH_FORCE=1` check-and-patch; timer only after patch ok; surface `needs-rebase` (no swallow)
 - PATH install to `~/.local/bin`; write L3 env only if missing
 

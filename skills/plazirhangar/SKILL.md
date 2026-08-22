@@ -18,7 +18,7 @@ Unified ship/entrypoint for the exact xbrd + xbgst-stack surface used on livepat
 
 - Livepatch owns the ban on general-purpose/explore
 - L3 concurrency plane independent (64)
-- Host specialists ≤16 per wave (hard lock; overflow → spark substrates at `-j 64` same turn)
+- Host specialists: `max_concurrent` **required** integer **1..16** (hard lock; overflow → spark substrates at `-j 64` same turn)
 - Rust-only for new heavy tooling; this script is transitional
 
 ## Honesty

@@ -1,0 +1,6 @@
+[Unit]
+Description=Grok Build livepatch timer (fixture)
+[Timer]
+OnBootSec=1min
+[Install]
+WantedBy=timers.target

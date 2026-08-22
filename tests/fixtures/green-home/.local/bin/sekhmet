@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+  echo "sekhmet 0.1.1-fixture"
+  exit 0
+fi
+echo "sekhmet fixture: unknown args" >&2
+exit 1
